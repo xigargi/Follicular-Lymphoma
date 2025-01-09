@@ -1,0 +1,599 @@
+---
+title: "Treball"
+author: "Ximo Garcia Gimeno"
+format: html
+editor: visual
+---
+
+## Carga de paquetes
+
+```{r}
+library(GEOquery)
+library(affy)
+library(gcrma)
+library(hgu133plus2.db)
+library(dplyr)
+library(factoextra)
+library(limma)
+library(devtools)
+library(clusterProfiler)
+library(tibble)
+library(plotly)
+library(stringr)
+library(enrichR)
+library(pheatmap)
+```
+
+## Descarga de datos
+
+```{r}
+files_85229 <- list.files(path = "./GSE85229/", full.names = TRUE)
+files_85233 <- list.files(path = "./GSE85223/", full.names = TRUE)
+files_66384 <- list.files(path = "./GSE66384/", full.names = TRUE)
+
+# Leemos los datos especificando los archivos correspondientes
+GSE85229 <- ReadAffy(filenames = files_85229)
+GSE85233 <- ReadAffy(filenames = files_85233)
+GSE66384 <- ReadAffy(filenames = files_66384)
+```
+
+## Combinación de datos
+
+```{r}
+combined_data <- Biobase::combine(GSE85233, GSE85229)
+combined_data <- Biobase::combine(combined_data, GSE66384)
+
+```
+
+### Normalización mediante GC-RMA
+
+```{r}
+normalized_data <- gcrma(combined_data)
+expr_comb <- exprs(normalized_data)
+```
+
+### Diagramas de caja
+
+```{r}
+# Antes de la normalización
+boxplot(combined_data, main = "Datos crudos - GSE Combinados", col = "lightblue")
+
+# Después de la normalización
+boxplot(expr_comb, main = "Datos normalizados - GSE Combinados", col = "lightgreen")
+```
+
+### Addición de identificadores
+
+```{r}
+# Obtener anotaciones para SYMBOL
+probe_annotations_comb <- AnnotationDbi::select(hgu133plus2.db, keys = rownames(expr_comb), columns = "SYMBOL", keytype = "PROBEID") %>% distinct(PROBEID, .keep_all = TRUE)
+
+
+# Alinear las anotaciones con los probesets de las matrices de expresión
+SYMBOL_comb<- probe_annotations_comb$SYMBOL[match(rownames(expr_comb), probe_annotations_comb$PROBEID)]
+
+expr_comb_annot <- data.frame(expr_comb, SYMBOL = SYMBOL_comb)
+```
+
+### Filtrado
+
+```{r}
+umbral <- log2(20)
+
+expr_comb_annot <- expr_comb_annot[apply(expr_comb_annot[, -ncol(expr_comb_annot)], 1, function(x) any(x > umbral)), ]
+
+# Filtrar por ausencia de símbolo genético
+expr_comb_annot <- expr_comb_annot[!is.na(expr_comb_annot$SYMBOL), ]
+
+```
+
+### PCA
+
+```{r}
+expr_comb_filtered <- select(expr_comb_annot, -SYMBOL)
+pca_result <- prcomp(t(expr_comb_filtered), center = TRUE, scale. = TRUE)
+
+# Extraer etiquetas del nombre de las muestras
+groups <- str_extract(rownames(pca_result$x), "FL_LN_B|LN_B|FLBM_STRO|NBM_STRO|FL|T")
+
+pca_df <- data.frame(
+  PC1 = pca_result$x[, 1],
+  PC2 = pca_result$x[, 2],
+  PC3 = pca_result$x[, 3],
+  Group = groups
+)
+explained_variance <- summary(pca_result)$importance[2, ]
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point(size = 3) +
+  labs(
+    title = "PCA: PC1 vs PC2",
+    x = paste0("PC1 (", round(explained_variance[1] * 100, 1), "%)"),
+    y = paste0("PC2 (", round(explained_variance[2] * 100, 1), "%)")
+  ) +
+  theme_minimal()
+
+# Gráfico PC1 vs PC3
+ggplot(pca_df, aes(x = PC1, y = PC3, color = Group)) +
+  geom_point(size = 3) +
+  labs(
+    title = "PCA: PC1 vs PC3",
+    x = paste0("PC1 (", round(explained_variance[1] * 100, 1), "%)"),
+    y = paste0("PC3 (", round(explained_variance[3] * 100, 1), "%)")
+  ) +
+  theme_minimal()
+
+fviz_screeplot(pca_result, addlabels = TRUE)
+
+```
+
+### HCA
+
+```{r}
+groups <- factor(combined_data$sample) 
+# División de los datos 
+expr_group1 <- expr_comb_filtered[, 1:10]  # Grupo B limfocitos
+expr_group2 <- expr_comb_filtered[, 11:26] # Grupo BM-MSC
+expr_group3 <- expr_comb_filtered[, 27:40] # Grupo Tfh
+
+
+filter_top5000 <- function(group_data) {
+  group_data$mean_intensity <- rowMeans(group_data, na.rm = TRUE)
+  
+  group_data <- group_data[order(group_data$mean_intensity, decreasing = TRUE), ]
+  
+  top5000 <- group_data[1:5000, ]
+  top5000 <- top5000[, -which(colnames(top5000) == "mean_intensity")]
+  
+  return(top5000)
+}
+
+top5000_group1 <- filter_top5000(expr_group1)
+top5000_group2 <- filter_top5000(expr_group2)
+top5000_group3 <- filter_top5000(expr_group3)
+combined_top5000 <- cbind(top5000_group1, top5000_group2, top5000_group3)
+scaled_data <- scale(combined_top5000)
+
+dist_matrix <- dist(t(scaled_data), method = "manhattan")  
+hclust_result <- hclust(dist_matrix, method = "complete")
+plot(hclust_result, main = "Dendrograma", xlab = "", sub = "", cex = 0.8)
+```
+
+### Heatmap
+
+```{r}
+pheatmap(t(scaled_data), 
+         scale = "row",
+         clustering_distance_rows = "euclidean", 
+         clustering_distance_cols = "euclidean", 
+         clustering_method = "complete", 
+         main = "Heatmap con HCA")
+```
+
+### Análisis individual
+
+#### GSE85229 BM-MSC
+
+```{r}
+GSE85229_gcrma <- gcrma(GSE85229)
+expr_BM_MSC <- exprs(GSE85229_gcrma)
+boxplot(GSE85229, main = "Datos crudos - BM-MSC", col = "lightblue")
+boxplot(expr_BM_MSC, main = "Datos normalizados GC-RMA - BM-MSC", col = "lightgreen")
+probe_annotations_BM_MSC <- AnnotationDbi::select(hgu133plus2.db, keys = rownames(expr_BM_MSC), columns = "SYMBOL", keytype = "PROBEID") %>% distinct(PROBEID, .keep_all = TRUE)
+SYMBOL_BM_MSC <- probe_annotations_BM_MSC$SYMBOL[match(rownames(expr_BM_MSC), probe_annotations_BM_MSC$PROBEID)]
+expr_BM_MSC_annot <- data.frame(expr_BM_MSC, SYMBOL = SYMBOL_BM_MSC)
+
+
+```
+
+#### GSE85233 B lymphocytes
+
+```{r}
+GSE85233_gcrma <- gcrma(GSE85233)
+expr_B <- exprs(GSE85233_gcrma)
+boxplot(GSE85233, main = "Datos crudos - B lymphocytes", col = "lightblue")
+boxplot(expr_B, main = "Datos normalizados GC-RMA - B lymphocytes", col = "lightgreen")
+probe_annotations_B <- AnnotationDbi::select(hgu133plus2.db, keys = rownames(expr_B), columns = "SYMBOL", keytype = "PROBEID") %>% distinct(PROBEID, .keep_all = TRUE)
+SYMBOL_B <- probe_annotations_B$SYMBOL[match(rownames(expr_B), probe_annotations_B$PROBEID)]
+expr_B_annot <- data.frame(expr_B, SYMBOL = SYMBOL_B)
+```
+
+#### GSE66384 Tfh
+
+```{r}
+GSE66384_gcrma <- gcrma(GSE66384)
+expr_Tfh <- exprs(GSE66384_gcrma)
+boxplot(GSE66384, main = "Datos crudos - Tfh", col = "lightblue")
+boxplot(expr_Tfh, main = "Datos normalizados GC-RMA - Tfh", col = "lightgreen")
+probe_annotations_Tfh <- AnnotationDbi::select(hgu133plus2.db, keys = rownames(expr_Tfh), columns = "SYMBOL", keytype = "PROBEID") %>% distinct(PROBEID, .keep_all = TRUE)
+SYMBOL_Tfh <- probe_annotations_Tfh$SYMBOL[match(rownames(expr_Tfh), probe_annotations_Tfh$PROBEID)]
+expr_Tfh_annot <- data.frame(expr_Tfh, SYMBOL = SYMBOL_Tfh)
+
+```
+
+### Test-t
+
+#### B lymphocytes
+
+```{r}
+B_lymphocytes_case <- expr_group1[,1:5]
+B_lymphocytes_control <- expr_group1[, 6:10]
+
+B_groups <- factor(c(rep("Case", ncol(B_lymphocytes_case)), 
+                     rep("Control", ncol(B_lymphocytes_control))))
+
+B_design <- model.matrix(~ 0 + B_groups)
+colnames(B_design) <- c("Case", "Control")
+B_combined <- cbind(B_lymphocytes_case, B_lymphocytes_control)
+
+
+fit_B <- lmFit(B_combined, B_design)
+
+
+contrast_B <- makeContrasts(Case_vs_Control = Case - Control, 
+                            levels = B_design)
+fit_B <- contrasts.fit(fit_B, contrast_B)
+fit_B <- eBayes(fit_B)
+
+deg_B <- topTable(fit_B, adjust = "fdr", p.value = 0.05)
+head(deg_B)
+
+```
+
+```{r}
+# Lista de probesets
+probesets <- c("230194_at", "225176_at", "201247_at", "229014_at")
+# Obtener símbolos genéticos asociados a los probesets
+symbols <- mapIds(hgu133plus2.db,
+                  keys = probesets,       # Probesets a mapear
+                  column = "SYMBOL",      # Obtener los símbolos genéticos
+                  keytype = "PROBEID",    # Tipo de clave de entrada (Probeset IDs)
+                  multiVals = "first")    # En caso de múltiples símbolos, tomar el primero
+
+# Mostrar los resultados
+symbols
+
+```
+
+#### BM-MSC
+
+```{r}
+BM_MSC_case <- expr_group2[,1:8]
+BM_MSC_control <- expr_group2[, 9:16]
+
+BM_MSC_groups <- factor(c(rep("Case", ncol(BM_MSC_case)), 
+                     rep("Control", ncol(BM_MSC_control))))
+
+BM_MSC_design <- model.matrix(~ 0 + BM_MSC_groups)
+colnames(BM_MSC_design) <- c("Case", "Control")
+BM_MSC_combined <- cbind(BM_MSC_case, BM_MSC_control)
+
+# Ajustar el modelo lineal
+fit_BM_MSC <- lmFit(BM_MSC_combined, BM_MSC_design)
+
+# Crear el contraste
+contrast_BM_MSC <- makeContrasts(Case_vs_Control = Case - Control, 
+                            levels = BM_MSC_design)
+fit_BM_MSC <- contrasts.fit(fit_BM_MSC, contrast_BM_MSC)
+fit_BM_MSC <- eBayes(fit_BM_MSC)
+
+# Obtener genes diferencialmente expresados
+deg_BM_MSC <- topTable(fit_BM_MSC, adjust = "fdr", p.value = 0.05)
+head(deg_BM_MSC)
+```
+
+#### Tfh
+
+```{r}
+Tfh_case <- expr_group2[,1:7]
+Tfh_control <- expr_group2[,8:14]
+
+Tfh_groups <- factor(c(rep("Case", ncol(Tfh_case)), 
+                     rep("Control", ncol(Tfh_control))))
+
+Tfh_design <- model.matrix(~ 0 + Tfh_groups)
+colnames(Tfh_design) <- c("Case", "Control")
+Tfh_combined <- cbind(Tfh_case, Tfh_control)
+
+# Ajustar el modelo lineal
+fit_Tfh <- lmFit(Tfh_combined, Tfh_design)
+
+# Crear el contraste
+contrast_Tfh <- makeContrasts(Case_vs_Control = Case - Control, 
+                            levels = Tfh_design)
+fit_Tfh <- contrasts.fit(fit_Tfh, contrast_Tfh)
+fit_Tfh <- eBayes(fit_Tfh)
+
+
+deg_Tfh <- topTable(fit_Tfh, adjust = "fdr", p.value = 0.2)
+head(deg_Tfh)
+```
+
+#### Scatterplot
+
+##### B lymphocytes
+
+```{r}
+B_case_mean <- rowMeans(B_lymphocytes_case)
+B_control_mean <- rowMeans(B_lymphocytes_control)
+df <- data.frame(
+  Control = B_control_mean,
+  Case = B_case_mean
+)
+
+ggplot(df, aes(x = Control, y = Case)) +
+  geom_point(aes(color = ifelse(Case > Control, "blue", "red")), alpha = 0.6) + 
+  labs(
+    x = "B_control",
+    y = "B_case",
+    title = "B_case vs B_control"
+  ) +scale_color_identity() 
+
+full_deg_B <- data.frame(
+  Gene = rownames(B_combined),
+  B_Case = rowMeans(B_lymphocytes_case),   
+  B_Control = rowMeans(B_lymphocytes_control), 
+  logFC = fit_B$coefficients[, "Case_vs_Control"], 
+  adj.P.Val = p.adjust(fit_B$p.value[, "Case_vs_Control"], method = "fdr")
+)
+full_deg_B$Significance <- ifelse(full_deg_B$adj.P.Val < 0.05, "Significativos", "No Significativos")
+
+ggplot(full_deg_B, aes(x = B_Control, y = B_Case, color = Significance)) +
+  geom_point(aes(size = Significance), alpha = 0.6, size=1) + 
+  scale_color_manual(values = c("Significativos" = "red", "No Significativos" = "gray")) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") + 
+  labs(title = "B_case vs B_control", x = "B_control", y = "B_case") +
+  theme_minimal() +   geom_text(
+    data = subset(full_deg_B, Significance == "Significativos"), 
+    aes(label = Gene), 
+    vjust = -0.5, hjust = 0.5, size = 3
+  )
+
+```
+
+##### BM-MSC
+
+```{r}
+BM_MSC_case_mean <- rowMeans(BM_MSC_case)
+BM_MSC_control_mean <- rowMeans(BM_MSC_control)
+df <- data.frame(
+  Control = BM_MSC_case_mean,
+  Case = BM_MSC_control_mean
+)
+
+ggplot(df, aes(x = Control, y = Case)) +
+  geom_point(aes(color = ifelse(Case > Control, "blue", "red")), alpha = 0.6) + 
+  labs(
+    x = "BM_MSC_control",
+    y = "BM_MSC_case",
+    title = "BM_MSC_case vs BM_MSC_control"
+  ) +scale_color_identity() 
+
+full_deg_BM_MSC <- data.frame(
+  Gene = rownames(BM_MSC_combined),
+  BM_MSC_Case = rowMeans(BM_MSC_case),   
+  BM_MSC_Control = rowMeans(BM_MSC_control), 
+  logFC = fit_BM_MSC$coefficients[, "Case_vs_Control"], 
+  adj.P.Val = p.adjust(fit_BM_MSC$p.value[, "Case_vs_Control"], method = "fdr")
+)
+full_deg_BM_MSC$Significance <- ifelse(full_deg_BM_MSC$adj.P.Val < 0.005, "Significativos", "No Significativos")
+
+ggplot(full_deg_BM_MSC, aes(x = BM_MSC_Control, y = BM_MSC_Case, color = Significance)) +
+  geom_point(aes(size = Significance), alpha = 0.6) + 
+  scale_size_manual(values = c("Significativos" = 3, "No Significativos" = 1)) +
+  scale_color_manual(values = c("Significativos" = "red", "No Significativos" = "gray")) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") + 
+  labs(title = "BM_MSC_case vs BM_MSC_control", x = "BM_MSC_control", y = "BM_MSC_case") +
+  theme_minimal() + 
+    geom_text(
+    data = subset(full_deg_BM_MSC, Significance == "Significativos"), 
+    aes(label = Gene), 
+    vjust = -0.5, hjust = 0.5, size = 3
+  )
+```
+
+##### Tfh
+
+```{r}
+Tfh_case_mean <- rowMeans(Tfh_case)
+Tfh_control_mean <- rowMeans(Tfh_control)
+df <- data.frame(
+  Control = Tfh_control_mean,
+  Case = Tfh_case_mean
+)
+
+ggplot(df, aes(x = Control, y = Case)) +
+  geom_point(aes(color = ifelse(Case > Control, "blue", "red")), alpha = 0.6) + 
+  labs(
+    x = "Tfh_control",
+    y = "Tfh_case",
+    title = "Tfh_case vs Tfh_control"
+  ) +
+  scale_color_identity()  
+
+full_deg_Tfh <- data.frame(
+  Gene = rownames(Tfh_combined),
+  Tfh_Case = rowMeans(Tfh_case),   
+  Tfh_Control = rowMeans(Tfh_control), 
+  logFC = fit_Tfh$coefficients[, "Case_vs_Control"], 
+  adj.P.Val = p.adjust(fit_Tfh$p.value[, "Case_vs_Control"], method = "fdr")
+)
+full_deg_Tfh$Significance <- ifelse(full_deg_Tfh$adj.P.Val < 0.2, "Significativos", "No Significativos")
+
+ggplot(full_deg_Tfh, aes(x = Tfh_Control, y = Tfh_Case, color = Significance)) +
+  geom_point(aes(size = Significance), alpha = 0.6) + 
+  scale_size_manual(values = c("Significativos" = 3, "No Significativos" = 1)) +
+  scale_color_manual(values = c("Significativos" = "red", "No Significativos" = "gray")) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") + 
+  labs(title = "Tfh_case vs Tfh_control", x = "Tfh_control", y = "Tfh_case") +
+  theme_minimal() + 
+    geom_text(
+    data = subset(full_deg_Tfh, Significance == "Significativos"), 
+    aes(label = Gene), 
+    vjust = -0.5, hjust = 0.5, size = 3
+  )
+```
+
+### GSEA
+
+#### B lymphocytes
+
+```{r}
+deg_B_annot <- deg_B %>%
+  rownames_to_column(var = "PROBEID") %>%
+  mutate(SYMBOL = mapIds(hgu133plus2.db, keys = PROBEID, column = "SYMBOL", keytype = "PROBEID", multiVals = "first"))
+
+dbs <- c("GO_Molecular_Function_2023","GO_Biological_Process_2023", "KEGG_2021_Human")
+enrich_B <- enrichR::enrichr(deg_B_annot$SYMBOL, dbs)
+head(enrich_B[["GO_Molecular_Function_2023"]])
+head(enrich_B[["GO_Biological_Process_2023"]])
+head(enrich_B[["KEGG_2021_Human"]])
+
+B_MF <- enrich_B[["GO_Molecular_Function_2023"]]
+B_MF <- B_MF %>%
+  arrange(desc(Combined.Score)) %>% 
+  slice_head(n = 10)
+
+ggplot(B_MF, aes(x = reorder(Term, Combined.Score), y = Combined.Score)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "B lymphocytes (GO: Molecular Function)",
+       y = "Combined Score") +
+  theme_minimal() +
+  coord_flip()+
+  theme(axis.text.y = element_text(size = 16))
+
+B_BP <- enrich_B[["GO_Biological_Process_2023"]]
+B_BP <- B_BP %>%
+  arrange(desc(Combined.Score)) %>% 
+  slice_head(n = 10)
+
+ggplot(B_BP, aes(x = reorder(Term, Combined.Score), y = Combined.Score)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "B lymphocytes (GO: Biological Process)",
+       y = "Combined Score") +
+  theme_minimal() +
+  coord_flip()+
+  theme(axis.text.y = element_text(size = 16))
+B_KEGG <- enrich_B[["KEGG_2021_Human"]]
+B_KEGG <- B_KEGG %>%
+  arrange(desc(Combined.Score)) %>% 
+  slice_head(n = 10)
+
+ggplot(B_KEGG, aes(x = reorder(Term, Combined.Score), y = Combined.Score)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "B lymphocytes (KEGG)",
+       y = "Combined Score") +
+  theme_minimal() +
+  coord_flip() +
+  theme(axis.text.y = element_text(size = 16))
+```
+
+#### BM-MSC
+
+```{r}
+deg_BM_MSC <- deg_BM_MSC %>% 
+  rownames_to_column(var = "PROBEID") %>% 
+  mutate(SYMBOL = mapIds(hgu133plus2.db, keys = PROBEID, column = "SYMBOL", keytype = "PROBEID"))
+
+# Realizar el análisis de enriquecimiento
+enrich_BM_MSC <- enrichR::enrichr(deg_BM_MSC$SYMBOL, dbs)
+
+# Revisar resultados para cada base de datos
+head(enrich_BM_MSC[["GO_Molecular_Function_2023"]])
+head(enrich_BM_MSC[["GO_Biological_Process_2023"]])
+head(enrich_BM_MSC[["KEGG_2021_Human"]])
+
+
+BM_MSC_MF <- enrich_BM_MSC[["GO_Molecular_Function_2023"]]
+BM_MSC_MF <- BM_MSC_MF %>%
+  arrange(desc(Combined.Score)) %>% 
+  slice_head(n = 10)
+
+ggplot(BM_MSC_MF, aes(x = reorder(Term, Combined.Score), y = Combined.Score)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "BM_MSC lymphocytes (GO: Molecular Function)",
+       y = "Combined Score") +
+  theme_minimal() +
+  coord_flip()+
+  theme(axis.text.y = element_text(size = 16))
+
+BM_MSC_BP <- enrich_BM_MSC[["GO_Biological_Process_2023"]]
+BM_MSC_BP <- BM_MSC_BP %>%
+  arrange(desc(Combined.Score)) %>% 
+  slice_head(n = 10)
+
+ggplot(BM_MSC_BP, aes(x = reorder(Term, Combined.Score), y = Combined.Score)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "BM_MSC lymphocytes (GO: Biological Process)",
+       y = "Combined Score") +
+  theme_minimal() +
+  coord_flip()+
+  theme(axis.text.y = element_text(size = 16))
+BM_MSC_KEGG <- enrich_BM_MSC[["KEGG_2021_Human"]]
+BM_MSC_KEGG <- BM_MSC_KEGG %>%
+  arrange(desc(Combined.Score)) %>% 
+  slice_head(n = 10)
+
+ggplot(BM_MSC_KEGG, aes(x = reorder(Term, Combined.Score), y = Combined.Score)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "BM_MSC lymphocytes (KEGG)",
+       y = "Combined Score") +
+  theme_minimal() +
+  coord_flip() +
+  theme(axis.text.y = element_text(size = 16))
+
+```
+
+#### Tfh
+
+```{r}
+deg_Tfh_annot <- deg_Tfh %>%
+  rownames_to_column(var = "PROBEID") %>%
+  mutate(SYMBOL = mapIds(hgu133plus2.db, keys = PROBEID, column = "SYMBOL", keytype = "PROBEID", multiVals = "first"))
+
+enrich_Tfh <- enrichR::enrichr(deg_Tfh_annot$SYMBOL, dbs)
+
+# Revisar resultados para cada base de datos
+head(enrich_Tfh[["GO_Molecular_Function_2023"]])
+head(enrich_Tfh[["GO_Biological_Process_2023"]])
+head(enrich_Tfh[["KEGG_2021_Human"]])
+
+
+Tfh_MF <- enrich_Tfh[["GO_Molecular_Function_2023"]]
+Tfh_MF <- Tfh_MF %>%
+  arrange(desc(Combined.Score)) %>% 
+  slice_head(n = 10)
+
+ggplot(Tfh_MF, aes(x = reorder(Term, Combined.Score), y = Combined.Score)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "Tfh lymphocytes (GO: Molecular Function)",
+       y = "Combined Score") +
+  theme_minimal() +
+  coord_flip()+
+  theme(axis.text.y = element_text(size = 16))
+
+Tfh_BP <- enrich_Tfh[["GO_Biological_Process_2023"]]
+Tfh_BP <- Tfh_BP %>%
+  arrange(desc(Combined.Score)) %>% 
+  slice_head(n = 10)
+
+ggplot(Tfh_BP, aes(x = reorder(Term, Combined.Score), y = Combined.Score)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "Tfh lymphocytes (GO: Biological Process)",
+       y = "Combined Score") +
+  theme_minimal() +
+  coord_flip()+
+  theme(axis.text.y = element_text(size = 16))
+Tfh_KEGG <- enrich_Tfh[["KEGG_2021_Human"]]
+Tfh_KEGG <- Tfh_KEGG %>%
+  arrange(desc(Combined.Score)) %>% 
+  slice_head(n = 10)
+
+ggplot(Tfh_KEGG, aes(x = reorder(Term, Combined.Score), y = Combined.Score)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "Tfh lymphocytes (KEGG)",
+       y = "Combined Score") +
+  theme_minimal() +
+  coord_flip() +
+  theme(axis.text.y = element_text(size = 16))
+```
