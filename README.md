@@ -7,4 +7,6 @@ como el linfoma difuso de células B grandes o tras desaparecer vuelva como un l
 
 El objetivo del estudio es identificar genes diferencialmente expresados, explorar rutas metabólicas y de señalización afectadas, y replicar los hallazgos de un artículo de referencia.
 
+Datos: https://drive.google.com/file/d/1kj6QCNHzH6cuTS5AZWlG-S-WOJ8XNXe5/view?usp=sharing
+
 
